@@ -1,0 +1,7 @@
+{
+  "name": "plate-calorie-checker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Photograph a plate of food and see roughly how many calories are on it."
+}

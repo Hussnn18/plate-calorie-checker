@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Plate Calorie Checker</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 640px;
+      margin: 0 auto;
+      padding: 20px 16px 40px;
+      color: #333;
+      background: #fafafa;
+    }
+    h1 { color: #E35925; margin-bottom: 4px; }
+    .subtitle { color: #2D616E; margin-top: 0; }
+    .card {
+      background: #fff;
+      border: 1px solid #e5e5e5;
+      border-radius: 10px;
+      padding: 16px;
+      margin-top: 16px;
+    }
+    #preview { width: 100%; border-radius: 8px; display: none; margin-top: 12px; }
+    button {
+      background: #E35925;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      padding: 12px 20px;
+      font-size: 16px;
+      width: 100%;
+      margin-top: 12px;
+      cursor: pointer;
+    }
+    button:disabled { background: #ccc; cursor: not-allowed; }
+    #photoCheck { margin-top: 10px; font-size: 14px; line-height: 1.5; }
+    #photoCheck .tip { color: #B9770E; }
+    .error { color: #C0392B; }
+    .muted { color: #888; }
+    .total { font-size: 40px; font-weight: bold; color: #E35925; margin: 0; }
+    .macros { color: #2D616E; margin: 4px 0 12px; }
+    table { width: 100%; border-collapse: collapse; }
+    th { text-align: left; font-size: 13px; color: #888; font-weight: normal; padding: 6px 4px; }
+    td { padding: 8px 4px; border-top: 1px solid #eee; vertical-align: top; }
+    td.kcal, th.kcal { text-align: right; white-space: nowrap; }
+    .food-name { font-weight: bold; }
+    .food-detail { font-size: 13px; color: #888; }
+    select { font-size: 15px; padding: 4px; }
+    .note { margin-top: 12px; font-size: 14px; }
+    .disclaimer { margin-top: 8px; font-size: 13px; color: #888; }
+  </style>
+</head>
+<body>
+  <h1>Plate Calorie Checker</h1>
+  <p class="subtitle">Take a photo of your plate. See roughly how many calories are on it.</p>
+
+  <div class="card">
+    <!-- No capture="..." here, so phones offer both the camera and the gallery -->
+    <input type="file" id="photo" accept="image/*" />
+    <img id="preview" alt="Plate photo preview" />
+    <div id="photoCheck"></div>
+    <button id="countBtn" disabled>Count calories</button>
+  </div>
+
+  <div class="card">
+    <h3>Results</h3>
+    <div id="results" class="muted">Choose a photo and press "Count calories".</div>
+  </div>
+
+  <script>
+    const photoInput = document.getElementById("photo");
+    const preview = document.getElementById("preview");
+    const photoCheck = document.getElementById("photoCheck");
+    const countBtn = document.getElementById("countBtn");
+    const results = document.getElementById("results");
+
+    let photoDataUrl = null; // the shrunk photo, ready to send
+    let counting = false;    // true while waiting for /api/calories
+    let foods = [];          // the foods the model found, each with an "amount" the user can change
+
+    // When a photo is chosen: shrink it, check it, show a preview, enable the button.
+    photoInput.addEventListener("change", async () => {
+      const file = photoInput.files[0];
+      if (!file) return;
+
+      // Forget the old photo first, so a failed read never sends the previous one.
+      photoDataUrl = null;
+      preview.style.display = "none";
+      photoCheck.textContent = "";
+      countBtn.disabled = true;
+
+      let img;
+      try {
+        img = await loadPhoto(file);
+      } catch (err) {
+        results.className = "error";
+        results.textContent = err.message + " Try a JPEG or PNG photo.";
+        return;
+      }
+
+      photoDataUrl = shrinkPhoto(img, 1280);
+      showPhotoCheck(checkPhoto(img));
+      URL.revokeObjectURL(img.src);
+
+      preview.src = photoDataUrl;
+      preview.style.display = "block";
+      countBtn.disabled = counting; // stay off if a count is still running
+      if (!counting) {
+        results.className = "muted";
+        results.textContent = 'Ready. Press "Count calories".';
+      }
+    });
+
+    // Send the photo to our own API (api/calories.js), never straight to Groq.
+    countBtn.addEventListener("click", async () => {
+      if (!photoDataUrl || counting) return;
+      counting = true;
+      countBtn.disabled = true;
+      results.className = "muted";
+      results.textContent = "Looking at your plate…";
+
+      try {
+        const response = await fetch("/api/calories", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ image: photoDataUrl }),
+        });
+
+        // If the server crashed or timed out, the reply may not be JSON.
+        const text = await response.text();
+        let data;
+        try {
+          data = JSON.parse(text);
+        } catch {
+          data = { error: `Server error ${response.status} — check the vercel dev terminal for details.` };
+        }
+
+        if (!response.ok) {
+          results.className = "error";
+          results.textContent = "Error: " + (data.error || `Server error ${response.status}.`);
+        } else if (!data.is_food) {
+          results.className = "";
+          results.textContent = "No food found in this photo. " + data.note;
+        } else {
+          foods = data.items.map((item) => ({ ...item, amount: 1 }));
+          showResults(data);
+        }
+      } catch (err) {
+        results.className = "error";
+        results.textContent = "Could not reach the server: " + err.message;
+      }
+      counting = false;
+      countBtn.disabled = !photoDataUrl;
+    });
+
+    // Build the results: big total, macros, and one table row per food.
+    function showResults(data) {
+      results.className = "";
+      results.textContent = "";
+
+      const total = document.createElement("p");
+      total.className = "total";
+      const macros = document.createElement("p");
+      macros.className = "macros";
+      results.append(total, macros);
+
+      const table = document.createElement("table");
+      table.innerHTML = '<tr><th>Food</th><th>Amount</th><th class="kcal">Calories</th></tr>';
+      foods.forEach((food) => {
+        const row = table.insertRow();
+
+        const nameCell = row.insertCell();
+        const name = document.createElement("div");
+        name.className = "food-name";
+        name.textContent = food.name;
+        const detail = document.createElement("div");
+        detail.className = "food-detail";
+        nameCell.append(name, detail);
+
+        // The model only guesses the portion, so let the user say "I ate half" or "I had two".
+        const amountCell = row.insertCell();
+        const select = document.createElement("select");
+        [[0, "None"], [0.5, "½×"], [1, "1×"], [1.5, "1½×"], [2, "2×"], [3, "3×"]].forEach(([value, label]) => {
+          select.add(new Option(label, value, value === 1, value === 1));
+        });
+        amountCell.append(select);
+
+        const kcalCell = row.insertCell();
+        kcalCell.className = "kcal";
+
+        food.update = () => {
+          detail.textContent = (food.portion ? food.portion + " · " : "") +
+            `P ${grams(food.protein_g * food.amount)} · C ${grams(food.carbs_g * food.amount)} · F ${grams(food.fat_g * food.amount)}`;
+          kcalCell.textContent = Math.round(food.calories * food.amount) + " kcal";
+        };
+        select.addEventListener("change", () => {
+          food.amount = Number(select.value);
+          food.update();
+          updateTotals();
+        });
+        food.update();
+      });
+      results.append(table);
+
+      const note = document.createElement("p");
+      note.className = "note";
+      note.textContent = `Confidence: ${data.confidence}.` + (data.note ? " " + data.note : "");
+      const disclaimer = document.createElement("p");
+      disclaimer.className = "disclaimer";
+      disclaimer.textContent = "Estimates from a photo can be off by 20–30%. Use them as a guide, not an exact count.";
+      results.append(note, disclaimer);
+
+      function updateTotals() {
+        const sum = (key) => foods.reduce((s, food) => s + food[key] * food.amount, 0);
+        total.textContent = Math.round(sum("calories")) + " kcal";
+        macros.textContent = `Protein ${grams(sum("protein_g"))} · Carbs ${grams(sum("carbs_g"))} · Fat ${grams(sum("fat_g"))}`;
+      }
+      updateTotals();
+    }
+
+    function grams(value) {
+      return Math.round(value) + " g";
+    }
+
+    // Open the chosen file as an image we can draw on a canvas.
+    function loadPhoto(file) {
+      return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = () => reject(new Error("Could not read that photo."));
+        img.src = URL.createObjectURL(file);
+      });
+    }
+
+    // Phone photos are large (5–10 MB). Shrink to at most `maxSize` pixels
+    // on the longest side and save as JPEG, so the upload is small and fast.
+    function shrinkPhoto(img, maxSize) {
+      const scale = Math.min(1, maxSize / Math.max(img.width, img.height));
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.round(img.width * scale);
+      canvas.height = Math.round(img.height * scale);
+      canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+      return canvas.toDataURL("image/jpeg", 0.85);
+    }
+
+    // Image processing: read the photo's pixels to spot dark or blurry photos,
+    // because the model guesses much worse when it can't see the food clearly.
+    function checkPhoto(img) {
+      const scale = Math.min(1, 512 / Math.max(img.width, img.height));
+      const w = Math.max(3, Math.round(img.width * scale));
+      const h = Math.max(3, Math.round(img.height * scale));
+      const canvas = document.createElement("canvas");
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
+      ctx.drawImage(img, 0, 0, w, h);
+      const pixels = ctx.getImageData(0, 0, w, h).data; // r, g, b, a, r, g, b, a, …
+
+      // 1. Brightness: turn every pixel into one grey value (0 = black, 255 = white) and average them.
+      const grey = new Float32Array(w * h);
+      let greyTotal = 0;
+      for (let i = 0; i < w * h; i++) {
+        grey[i] = 0.299 * pixels[i * 4] + 0.587 * pixels[i * 4 + 1] + 0.114 * pixels[i * 4 + 2];
+        greyTotal += grey[i];
+      }
+      const brightness = greyTotal / (w * h);
+
+      // 2. Sharpness: compare each pixel with its 4 neighbours (a "Laplacian" filter).
+      //    Sharp photos have strong edges, so these differences vary a lot; blurry photos don't.
+      let sum = 0, sumOfSquares = 0, count = 0;
+      for (let y = 1; y < h - 1; y++) {
+        for (let x = 1; x < w - 1; x++) {
+          const i = y * w + x;
+          const edge = grey[i - 1] + grey[i + 1] + grey[i - w] + grey[i + w] - 4 * grey[i];
+          sum += edge;
+          sumOfSquares += edge * edge;
+          count++;
+        }
+      }
+      const mean = sum / count;
+      const sharpness = sumOfSquares / count - mean * mean; // the variance of the edge values
+
+      return { brightness, sharpness };
+    }
+
+    function showPhotoCheck({ brightness, sharpness }) {
+      const tips = [];
+      if (brightness < 60) tips.push("The photo looks dark. Turn on a light or move near a window.");
+      if (brightness > 220) tips.push("The photo looks washed out. Avoid flash or direct sunlight.");
+      if (sharpness < 40) tips.push("The photo looks blurry. Hold the phone steady and tap the food to focus.");
+
+      photoCheck.textContent = "";
+      const summary = document.createElement("div");
+      summary.className = "muted";
+      summary.textContent = `Photo check: light ${Math.round(brightness)}/255, sharpness ${Math.round(sharpness)}` +
+        (tips.length ? "" : " — looks good.");
+      photoCheck.append(summary);
+      tips.forEach((tip) => {
+        const line = document.createElement("div");
+        line.className = "tip";
+        line.textContent = "⚠ " + tip + " You can still count, but the estimate may be less accurate.";
+        photoCheck.append(line);
+      });
+    }
+  </script>
+</body>
+</html>
